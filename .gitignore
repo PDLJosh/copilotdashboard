@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# This repository is PUBLIC. Exported tenant data must never be committed.
+# The scripts write to C:\M365CopilotReport by default, outside the repo, but
+# these rules are a safety net in case someone points -OutputFolder here.
+# ---------------------------------------------------------------------------
+
+# Tenant exports and logs
+Copilot_Events*.csv
+Copilot_Users*.csv
+AuditScriptLog*.txt
+*.csv.tmp
+
+# Power BI files that embed imported data (.pbit templates do not)
+*.pbix
+*.pbix.tmp
+
+# Archives and certificates
+*.zip
+*.pfx
+*.cer
+*.pem
+*.key
+
+# The only CSV files allowed: fictitious sample data
+!examples/sample-data/Copilot_Events.csv
+!examples/sample-data/Copilot_Users.csv
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+testResults.xml
