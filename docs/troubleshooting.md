@@ -34,12 +34,14 @@ The reverse also happens: a GCC tenant is **not** GCC High. If your domain ends 
 Common on jump boxes and hardened desktops, where the Windows account broker (WAM) cannot show
 its window.
 
-- Exchange Online: connect yourself with WAM disabled, then tell the script to reuse the session:
+- Exchange Online: sign in through the browser instead of WAM:
   ```powershell
-  Connect-ExchangeOnline -DisableWAM                                                # Commercial, GCC
-  Connect-ExchangeOnline -DisableWAM -ExchangeEnvironmentName O365USGovGCCHigh      # GCC High
-  .\Get-CopilotAuditEvents.ps1 -UseExistingSession
+  .\Get-CopilotAuditEvents.ps1 -DisableWAM
   ```
+  Use the same switch if **the PowerShell window closes by itself** at the moment the prompt
+  should open. That is the account broker crashing PowerShell; the Windows Application event
+  log then shows `pwsh.exe` faulting in `msalruntime.dll` with exception code `0xc0000005`.
+  This was seen on a fully patched Windows 11 machine, so it is not a rare misconfiguration.
 - Microsoft Graph: turn WAM off once (the setting is remembered), then run the script normally:
   ```powershell
   Set-MgGraphOption -DisableLoginByWAM $true
@@ -55,6 +57,22 @@ Nobody has yet consented to `User.Read.All` and `Organization.Read.All` for *Mic
 Command Line Tools* in your tenant. Ask an administrator who can grant consent to run the script
 once and tick **Consent on behalf of your organization**, or to grant it in the Entra admin
 center under **Enterprise applications**.
+
+### "Assembly with same name is already loaded" / "Could not load file or assembly 'Microsoft.Graph.Authentication'"
+
+The Microsoft Graph PowerShell modules only load together when their versions match exactly, and
+PCs that have been updated over time often hold several versions side by side - for example
+`Microsoft.Graph.Authentication` 2.32.0 and 2.36.1 but `Microsoft.Graph.Users` 2.32.0 only. The
+script looks for the newest version that all three required modules share and loads that. If it
+finds none, it lists what is installed and stops. Install a matching set:
+
+```powershell
+Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagement -Scope CurrentUser -Force
+```
+
+If you connected yourself and used `-UseExistingSession`, the script must stay on the version
+your session already loaded; when the other modules are not installed in that version, either
+install them as above or start a new PowerShell window and let the script connect.
 
 ### The PowerShell Gallery is blocked
 
@@ -102,6 +120,12 @@ continues from where it stopped. If it fails repeatedly at the same date, try sm
 ```powershell
 .\Get-CopilotAuditEvents.ps1 -IntervalMinutes 360
 ```
+
+### "Audit log search argument startDate ... is later than endDate"
+
+Seen with copies of this script from before 22 September 2026 on machines whose clock is not
+set to UTC: the resumed timestamp was treated as local time and shifted past the end of the
+search. Download the current version; no change to your CSV file is needed.
 
 ### "Reducing the interval" messages
 

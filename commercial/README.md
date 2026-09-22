@@ -49,7 +49,7 @@ Expected output:
 ```
 Connected to Microsoft Graph (Commercial).
 Copilot product: 639dec6b-bb19-468b-871c-c5c441c4b0cb  Microsoft_365_Copilot  (known ID)
-Processing 5120 users...
+Read 5120 users from Entra ID; 5120 have a job title and will be exported.
 Report exported to C:\M365CopilotReport\Copilot_Users.csv
 Users exported: 5120. With a Microsoft 365 Copilot license: 900.
 ```

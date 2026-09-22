@@ -58,7 +58,7 @@ Describe 'Installed modules accept what the scripts pass to them' {
         Import-Module ExchangeOnlineManagement
         $command = Get-Command Connect-ExchangeOnline
         [enum]::GetNames($command.Parameters['ExchangeEnvironmentName'].ParameterType) | Should -Contain 'O365USGovGCCHigh'
-        'AppId', 'Organization', 'CertificateThumbprint', 'UserPrincipalName', 'ShowBanner' | ForEach-Object { $command.Parameters.Keys | Should -Contain $_ }
+        'AppId', 'Organization', 'CertificateThumbprint', 'UserPrincipalName', 'ShowBanner', 'DisableWAM' | ForEach-Object { $command.Parameters.Keys | Should -Contain $_ }
     }
 
     It 'Connect-MgGraph supports the USGov environment and certificate sign-in' -Skip:(-not $HasGraphModule) {

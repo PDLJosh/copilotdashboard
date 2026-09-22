@@ -32,6 +32,10 @@
 .PARAMETER UserPrincipalName
     Optional sign-in name to pre-fill the interactive sign-in prompt.
 
+.PARAMETER DisableWAM
+    Sign in through the web browser instead of the Windows account broker (WAM). Use this if
+    the sign-in prompt never appears, or PowerShell closes or hangs when the prompt should open.
+
 .PARAMETER AppId
     Application (client) ID for unattended, certificate-based sign-in. See docs/scheduling.md.
 
@@ -82,6 +86,9 @@ param(
     [Parameter(ParameterSetName = 'Interactive')]
     [string]$UserPrincipalName,
 
+    [Parameter(ParameterSetName = 'Interactive')]
+    [switch]$DisableWAM,
+
     [Parameter(ParameterSetName = 'AppOnly', Mandatory = $true)]
     [string]$AppId,
 
@@ -107,20 +114,49 @@ $MaxRecordsPerWindow = 50000
 $MinIntervalMinutes = 5
 $MaxWindowAttempts = 3
 $RetryDelaySeconds = 15
+$script:AppHostSummary = @{}       # 'AppHost -> App' counts, logged at the end to help improve the mapping
+# Host applications named in Microsoft's audit documentation, mapped to the app names the report
+# uses. Used when the record carries no recognised file or meeting context.
+# https://learn.microsoft.com/purview/audit-copilot#common-apphost-scenarios-in-copilot
+$AppHostMap = @{
+    'BizChat' = 'Copilot for M365 Chat'; 'Bing' = 'Copilot for M365 Chat'; 'Edge' = 'Copilot for M365 Chat'
+    'Office' = 'Copilot for M365 Chat'; 'M365App' = 'Copilot for M365 Chat'
+    'OfficeCopilotNotebook' = 'Copilot for M365 Chat'; 'OfficeCopilotSearchAnswer' = 'Copilot for M365 Chat'
+    'OneNoteCopilotNotebook' = 'Copilot for M365 Chat'
+    'Word' = 'Word'; 'WordOnCanvas' = 'Word'
+    'Excel' = 'Excel'
+    'PowerPoint' = 'PowerPoint'; 'PowerPointOnCanvas' = 'PowerPoint'
+    'Outlook' = 'Outlook'; 'OutlookOnCanvas' = 'Outlook'; 'OutlookSidepane' = 'Outlook'
+    'Teams' = 'Teams'; 'Loop' = 'Loop'; 'Whiteboard' = 'Whiteboard'; 'Stream' = 'Stream'
+    'OneNote' = 'OneNote'; 'SharePoint' = 'SharePoint'; 'OneDrive' = 'OneDrive'
+    'Forms' = 'Forms'; 'Planner' = 'Planner'; 'Designer' = 'Designer'
+    'VivaEngage' = 'Viva Engage'; 'VivaGoals' = 'Viva Goals'; 'VivaPulse' = 'Viva Pulse'
+    'Copilot Studio' = 'Copilot Studio Agent'
+}
 
 function Write-LogFile ([string]$Message) {
     $final = [DateTime]::UtcNow.ToString('s') + ':' + $Message
     $final | Out-File -FilePath $script:LogFile -Append -Encoding utf8
 }
 
-# The CSV always starts a data row with the quoted 20-character timestamp.
+# The CSV always starts a data row with the quoted 20-character timestamp, which is UTC. The result
+# is marked as UTC: Exchange Online treats a date without a kind as local time, which would shift
+# every incremental search window by the machine's time-zone offset.
 function Get-CsvLineTimestamp ([string]$Line) {
     if ($Line.Length -lt 22 -or $Line[0] -ne '"') { return $null }
     $parsed = [DateTime]::MinValue
-    if ([DateTime]::TryParseExact($Line.Substring(1, 20), $TimestampFormat, $Invariant, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ([DateTime]::TryParseExact($Line.Substring(1, 20), $TimestampFormat, $Invariant, $styles, [ref]$parsed)) {
         return $parsed
     }
     return $null
+}
+
+# Identifies an exported event by the values that come straight from the audit record. The derived
+# App, Location and AgentName columns are left out so that a newer script version that classifies
+# an event differently still recognises it as already exported.
+function Get-EventKey ($Row) {
+    return (($Row.TimeStamp, $Row.User, $Row.'App context', $Row.'Accessed Resource Locations', $Row.Action) -join [char]31)
 }
 
 # Finds the newest exported event and counts the rows inside the overlap period so that
@@ -132,7 +168,9 @@ function Get-ExistingEventState ([string]$Path, [int]$OverlapHours) {
     }
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $state }
 
+    $header = $null
     foreach ($line in [System.IO.File]::ReadLines($Path)) {
+        if ($null -eq $header) { $header = $line }
         $timestamp = Get-CsvLineTimestamp $line
         if ($null -ne $timestamp -and ($null -eq $state.NewestTimestamp -or $timestamp -gt $state.NewestTimestamp)) {
             $state.NewestTimestamp = $timestamp
@@ -141,10 +179,15 @@ function Get-ExistingEventState ([string]$Path, [int]$OverlapHours) {
     if ($null -eq $state.NewestTimestamp) { return $state }
 
     $cutoff = $state.NewestTimestamp.AddHours(-$OverlapHours)
+    $overlapLines = New-Object 'System.Collections.Generic.List[string]'
     foreach ($line in [System.IO.File]::ReadLines($Path)) {
         $timestamp = Get-CsvLineTimestamp $line
-        if ($null -ne $timestamp -and $timestamp -ge $cutoff) {
-            if ($state.OverlapRows.ContainsKey($line)) { $state.OverlapRows[$line]++ } else { $state.OverlapRows[$line] = 1 }
+        if ($null -ne $timestamp -and $timestamp -ge $cutoff) { $overlapLines.Add($line) }
+    }
+    if ($overlapLines.Count -gt 0) {
+        foreach ($row in ((@($header) + @($overlapLines)) | ConvertFrom-Csv)) {
+            $key = Get-EventKey $row
+            if ($state.OverlapRows.ContainsKey($key)) { $state.OverlapRows[$key]++ } else { $state.OverlapRows[$key] = 1 }
         }
     }
     return $state
@@ -200,9 +243,9 @@ function ConvertTo-CopilotEventRow ($Record) {
         $CopilotApp = "Outlook"
     } ElseIf ($AuditData.CopilotEventData.AppHost -eq "Copilot Studio") {
         $CopilotApp = "Copilot Studio Agent"
-    } ElseIf ($CopilotApp -eq 'Copilot for M365' -and $AuditData.CopilotEventData.AppHost -in 'Word', 'Excel', 'PowerPoint', 'Teams', 'Loop', 'Whiteboard', 'Stream') {
-        # No file context (for example an unsaved document): fall back to the hosting app.
-        $CopilotApp = [string]$AuditData.CopilotEventData.AppHost
+    } ElseIf ($CopilotApp -eq 'Copilot for M365' -and $AuditData.CopilotEventData.AppHost -and $AppHostMap.ContainsKey([string]$AuditData.CopilotEventData.AppHost)) {
+        # No recognised file or meeting context: classify by the host application Microsoft recorded.
+        $CopilotApp = $AppHostMap[[string]$AuditData.CopilotEventData.AppHost]
     }
 
     If ($AuditData.CopilotEventData.Contexts.Id) {
@@ -237,6 +280,9 @@ function ConvertTo-CopilotEventRow ($Record) {
     [string]$AccessedResourceLocations = $AccessedResourceLocations -join ", "
     [array]$AccessedResourceActions = $AuditData.CopilotEventData.AccessedResources.Action | Sort-Object -Unique
     [string]$AccessedResourceActions = $AccessedResourceActions -join ", "
+
+    $summaryKey = "$(if ($AuditData.CopilotEventData.AppHost) { $AuditData.CopilotEventData.AppHost } else { '(no AppHost)' }) -> $CopilotApp"
+    $script:AppHostSummary[$summaryKey] = 1 + $(if ($script:AppHostSummary.ContainsKey($summaryKey)) { $script:AppHostSummary[$summaryKey] } else { 0 })
 
     $created = [DateTime]$Record.CreationDate
     if ($created.Kind -eq [DateTimeKind]::Local) { $created = $created.ToUniversalTime() }
@@ -316,8 +362,9 @@ if (-not $UseExistingSession) {
         $connectParams.AppId = $AppId
         $connectParams.Organization = $Organization
         $connectParams.CertificateThumbprint = $CertificateThumbprint
-    } elseif ($UserPrincipalName) {
-        $connectParams.UserPrincipalName = $UserPrincipalName
+    } else {
+        if ($UserPrincipalName) { $connectParams.UserPrincipalName = $UserPrincipalName }
+        if ($DisableWAM) { $connectParams.DisableWAM = $true }
     }
 
     try {
@@ -337,7 +384,7 @@ try {
     [DateTime]$end = [DateTime]::UtcNow
     $existing = Get-ExistingEventState -Path $outputFile -OverlapHours $OverlapHours
     if ($null -ne $existing.NewestTimestamp) {
-        [DateTime]$start = $existing.NewestTimestamp.AddHours(-$OverlapHours)
+        [DateTime]$start = [DateTime]::SpecifyKind($existing.NewestTimestamp, [DateTimeKind]::Utc).AddHours(-$OverlapHours)
         Write-Host "Existing export found. Newest event: $($existing.NewestTimestamp.ToString('u')). Resuming from $($start.ToString('u'))."
     } else {
         [DateTime]$start = $end.AddDays(-$InitialLookbackDays)
@@ -384,27 +431,30 @@ try {
             continue
         }
 
+        # A record on the boundary between two windows is returned by both; the second copy is dropped here.
         $records = @($window.Records | Where-Object { $seenThisRun.Add([string]$_.Identity) } | Sort-Object { $_.CreationDate -as [DateTime] })
-        if ($records.Count -lt $window.ResultCount) {
-            Write-LogFile "WARN: Expected $($window.ResultCount) records for this time range but received $($records.Count) new ones."
+        if (@($window.Records).Count -lt $window.ResultCount) {
+            Write-LogFile "WARN: The service reported $($window.ResultCount) records for this time range but returned $(@($window.Records).Count)."
         }
 
         if ($records.Count -gt 0) {
             Write-Host ("{0} Copilot audit records found. Now analyzing the content" -f $records.Count)
-            $csv = @($records | ForEach-Object { ConvertTo-CopilotEventRow $_ } | ConvertTo-Csv -NoTypeInformation)
-
-            $newLines = New-Object 'System.Collections.Generic.List[string]'
-            if (-not $fileHasHeader) { $newLines.Add($csv[0]); $fileHasHeader = $true }
-            foreach ($line in ($csv | Select-Object -Skip 1)) {
-                if ($existing.OverlapRows.ContainsKey($line) -and $existing.OverlapRows[$line] -gt 0) {
-                    $existing.OverlapRows[$line]--
+            $newRows = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($row in @($records | ForEach-Object { ConvertTo-CopilotEventRow $_ })) {
+                $key = Get-EventKey $row
+                if ($existing.OverlapRows.ContainsKey($key) -and $existing.OverlapRows[$key] -gt 0) {
+                    $existing.OverlapRows[$key]--
                     $totalSkipped++
                 } else {
-                    $newLines.Add($line)
+                    $newRows.Add($row)
                     $totalWritten++
                 }
             }
-            if ($newLines.Count -gt 0) { [System.IO.File]::AppendAllLines($outputFile, $newLines, $Utf8NoBom) }
+            if ($newRows.Count -gt 0) {
+                $csv = @($newRows | ConvertTo-Csv -NoTypeInformation)
+                if ($fileHasHeader) { $csv = @($csv | Select-Object -Skip 1) } else { $fileHasHeader = $true }
+                [System.IO.File]::AppendAllLines($outputFile, [string[]]$csv, $Utf8NoBom)
+            }
             $totalRetrieved += $records.Count
         }
 
@@ -418,6 +468,10 @@ try {
         $currentStart = $currentEnd
     }
 
+    if ($script:AppHostSummary.Count -gt 0) {
+        $summary = ($script:AppHostSummary.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
+        Write-LogFile "INFO: Apps by audit AppHost this run: $summary"
+    }
     Write-LogFile "END: Retrieving audit records between $($start) and $($end). Retrieved: $totalRetrieved, written: $totalWritten, already exported: $totalSkipped."
     Write-Host "Script complete! Retrieved $totalRetrieved audit records between $($start) and $($end). New rows written: $totalWritten. Already exported (skipped): $totalSkipped." -ForegroundColor Green
     Write-Host "Output: $outputFile"

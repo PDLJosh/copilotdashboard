@@ -44,7 +44,15 @@ BeforeAll {
         $global:SearchCalls++
         if ($global:FailNextSearches -gt 0) { $global:FailNextSearches--; throw 'Simulated transient service error' }
 
-        $inRange = @($global:FakeAuditLog | Where-Object { $_.CreationDate -ge $StartDate -and $_.CreationDate -lt $EndDate })
+        # Like the real module, a date without a kind is taken as local time and converted to UTC.
+        # A fixed 5-hour offset stands in for the machine's time zone so the tests behave the same everywhere.
+        $StartDate = [datetime]$StartDate; $EndDate = [datetime]$EndDate
+        if ($StartDate.Kind -eq 'Unspecified') { $StartDate = [datetime]::SpecifyKind($StartDate.AddHours(5), 'Utc') }
+        if ($EndDate.Kind -eq 'Unspecified') { $EndDate = [datetime]::SpecifyKind($EndDate.AddHours(5), 'Utc') }
+        if ($StartDate -gt $EndDate) { throw "Audit log search argument startDate ($StartDate) is later than endDate ($EndDate)." }
+
+        # Inclusive at both ends, like the real service: a record on a window boundary is returned by both windows.
+        $inRange = @($global:FakeAuditLog | Where-Object { $_.CreationDate -ge $StartDate -and $_.CreationDate -le $EndDate })
         $total = $inRange.Count
         if ($global:ReportedCountOverride -and (($EndDate - $StartDate).TotalMinutes -gt $global:OverrideAboveMinutes)) { $total = $global:ReportedCountOverride }
 
@@ -98,6 +106,12 @@ Describe 'ConvertTo-CopilotEventRow' {
         } finally { [cultureinfo]::CurrentCulture = $previous }
     }
 
+    It 'reads CSV timestamps back as UTC so incremental windows are not shifted by the time zone' {
+        $stamp = Get-CsvLineTimestamp '"05-Mar-2026 14:07:09","adele.vance@contoso.com","Word",,,"","","",""'
+        $stamp.Kind | Should -Be ([DateTimeKind]::Utc)
+        $stamp | Should -Be ([datetime]::new(2026, 3, 5, 14, 7, 9, [DateTimeKind]::Utc))
+    }
+
     It 'maps <AppHost> with context type <Type> to <Expected>' -ForEach @(
         @{ AppHost = 'bizchat';        Type = $null;          Expected = 'Copilot for M365 Chat' }
         @{ AppHost = 'Outlook';        Type = $null;          Expected = 'Outlook' }
@@ -108,6 +122,12 @@ Describe 'ConvertTo-CopilotEventRow' {
         @{ AppHost = 'Office';         Type = 'TeamsMeeting'; Expected = 'Teams' }
         @{ AppHost = 'Office';         Type = 'StreamVideo';  Expected = 'Stream' }
         @{ AppHost = 'Word';           Type = $null;          Expected = 'Word' }
+        @{ AppHost = 'Office';         Type = $null;          Expected = 'Copilot for M365 Chat' }
+        @{ AppHost = 'M365App';        Type = $null;          Expected = 'Copilot for M365 Chat' }
+        @{ AppHost = 'Edge';           Type = $null;          Expected = 'Copilot for M365 Chat' }
+        @{ AppHost = 'WordOnCanvas';   Type = $null;          Expected = 'Word' }
+        @{ AppHost = 'OutlookSidepane'; Type = $null;         Expected = 'Outlook' }
+        @{ AppHost = 'OneNote';        Type = $null;          Expected = 'OneNote' }
         @{ AppHost = 'SomethingNew';   Type = $null;          Expected = 'Copilot for M365' }
     ) {
         $contexts = if ($Type) { @(@{ Id = 'https://contoso.sharepoint.com/sites/hr/doc'; Type = $Type }) } else { @() }
@@ -175,6 +195,18 @@ Describe 'Get-CopilotAuditEvents.ps1 export' {
         $lines[0] | Should -BeExactly '"TimeStamp","User","App","Location","App context","Accessed Resources","Accessed Resource Locations","Action","AgentName"'
         $lines.Count | Should -Be 2
         [System.IO.File]::ReadAllBytes($Csv)[0] | Should -Be ([byte][char]'"') -Because 'the file must not start with a byte order mark'
+    }
+
+    It 'logs how each audit AppHost was mapped, without user data' {
+        $global:FakeAuditLog = @(
+            New-FakeAuditRecord -CreationDate $Now.AddHours(-2) -AppHost 'bizchat'
+            New-FakeAuditRecord -CreationDate $Now.AddHours(-3) -AppHost 'bizchat'
+            New-FakeAuditRecord -CreationDate $Now.AddHours(-4) -AppHost 'SomethingNew'
+        )
+        Invoke-EventsScript $Folder @{ InitialLookbackDays = 1 }
+        $log = (Get-Content (Join-Path $Folder 'AuditScriptLog.txt')) -join "`n"
+        $log | Should -Match 'Apps by audit AppHost this run: bizchat -> Copilot for M365 Chat=2, SomethingNew -> Copilot for M365=1'
+        $log | Should -Not -Match 'adele.vance'
     }
 
     It 'writes rows in date order and removes duplicate records returned by the service' {
@@ -250,6 +282,32 @@ Describe 'Get-CopilotAuditEvents.ps1 export' {
         $users = @(Import-Csv $Csv).User
         $users | Should -Contain 'fresh@contoso.com'
         $users | Should -Not -Contain 'ancient@contoso.com' -Because 'incremental runs must not re-read the whole lookback period'
+    }
+
+    It 'recognises rows exported by an older version that classified the app differently' {
+        $when = $Now.AddHours(-3)
+        New-Item -ItemType Directory -Path $Folder | Out-Null
+        $stamp = $when.ToString('dd-MMM-yyyy HH:mm:ss', [cultureinfo]::InvariantCulture)
+        @(
+            '"TimeStamp","User","App","Location","App context","Accessed Resources","Accessed Resource Locations","Action","AgentName"'
+            "`"$stamp`",`"old@contoso.com`",`"Copilot for M365`",,`"19:thread-1@thread.v2`",`"`",`"`",`"`",`"`""
+        ) | Set-Content -Path $Csv -Encoding utf8
+        # The same event, now classified as Copilot Chat because its AppHost is Office.
+        $global:FakeAuditLog = @(New-FakeAuditRecord -CreationDate $when -AppHost 'Office' -User 'old@contoso.com')
+        Invoke-EventsScript $Folder
+        @(Import-Csv $Csv).Count | Should -Be 1
+    }
+
+    It 'exports a record that sits exactly on a window boundary once, without a warning' {
+        # With a 1-day lookback and 60-minute windows, a record 60 minutes after the start lands on the first boundary.
+        $start = $Now.AddDays(-1)
+        $global:FakeAuditLog = @(
+            New-FakeAuditRecord -CreationDate $start.AddMinutes(60) -User 'boundary@contoso.com'
+            New-FakeAuditRecord -CreationDate $start.AddMinutes(90) -User 'later@contoso.com'
+        )
+        Invoke-EventsScript $Folder @{ InitialLookbackDays = 1; IntervalMinutes = 60 }
+        @(Import-Csv $Csv).Count | Should -Be 2
+        (Get-Content (Join-Path $Folder 'AuditScriptLog.txt')) -join "`n" | Should -Not -Match 'WARN'
     }
 
     It 'halves the search window when a window reaches the 50,000 record limit' {

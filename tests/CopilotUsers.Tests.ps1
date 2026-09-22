@@ -55,6 +55,10 @@ BeforeAll {
         $user.Manager
     }
 
+    # The script only imports real Graph modules when one is already loaded or it has to connect.
+    # Unload any that another test file loaded so these runs use the fakes below.
+    Get-Module -Name 'Microsoft.Graph.*' | Remove-Module -Force -ErrorAction SilentlyContinue
+
     function Invoke-UsersScript ([string]$Folder, [hashtable]$Extra = @{}) {
         & $script:UsersScript -OutputFolder $Folder -UseExistingSession @Extra 3> $null 6> $null
     }
@@ -124,6 +128,15 @@ Describe 'Get-CopilotUsers.ps1' {
         (Import-Csv $Csv).DisplayName | Should -Contain 'Room 4 North'
     }
 
+    It 'warns when the job-title filter removes every user' {
+        $global:FakeUsers = @(New-FakeUser 'Blank Title' -JobTitle $null; New-FakeUser 'Also Blank' -JobTitle '')
+        $warnings = & $script:UsersScript -OutputFolder $Folder -UseExistingSession 3>&1 6> $null | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }
+        ($warnings.Message -join ' ') | Should -Match 'None of the users have a job title'
+        @(Import-Csv $Csv).Count | Should -Be 0
+        & $script:UsersScript -OutputFolder $Folder -UseExistingSession -IncludeUsersWithoutJobTitle 3> $null 6> $null
+        @(Import-Csv $Csv).Count | Should -Be 2
+    }
+
     It 'exports manager details, and leaves them empty when there is no manager' {
         Invoke-UsersScript $Folder
         $rows = Import-Csv $Csv
@@ -137,5 +150,34 @@ Describe 'Get-CopilotUsers.ps1' {
         $global:RejectExpand = $true
         Invoke-UsersScript $Folder
         (Import-Csv $Csv | Where-Object DisplayName -eq 'Avery Howard').ManagerName | Should -Be 'Jordan Reyes'
+    }
+}
+
+Describe 'Select-CommonModuleVersion' {
+    BeforeAll { . $script:UsersScript }
+
+    It 'picks the newest version that every module has installed' {
+        $available = @{
+            'Microsoft.Graph.Authentication'               = @([version]'2.32.0', [version]'2.36.1')
+            'Microsoft.Graph.Users'                        = @([version]'2.32.0')
+            'Microsoft.Graph.Identity.DirectoryManagement' = @([version]'2.32.0', [version]'2.36.1')
+        }
+        Select-CommonModuleVersion -Available $available | Should -Be ([version]'2.32.0')
+    }
+
+    It 'prefers the newest version when all modules share several' {
+        $available = @{ A = @([version]'2.32.0', [version]'2.36.1'); B = @([version]'2.36.1', [version]'2.32.0') }
+        Select-CommonModuleVersion -Available $available | Should -Be ([version]'2.36.1')
+    }
+
+    It 'returns nothing when the modules have no version in common or one is missing' {
+        Select-CommonModuleVersion -Available @{ A = @([version]'2.36.1'); B = @([version]'2.32.0') } | Should -BeNullOrEmpty
+        Select-CommonModuleVersion -Available @{ A = @([version]'2.36.1'); B = @() } | Should -BeNullOrEmpty
+    }
+
+    It 'stays on the version that is already loaded in the session' {
+        $available = @{ A = @([version]'2.32.0', [version]'2.36.1'); B = @([version]'2.32.0', [version]'2.36.1') }
+        Select-CommonModuleVersion -Available $available -Pinned ([version]'2.32.0') | Should -Be ([version]'2.32.0')
+        Select-CommonModuleVersion -Available $available -Pinned ([version]'2.30.0') | Should -BeNullOrEmpty
     }
 }

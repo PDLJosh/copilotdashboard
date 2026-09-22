@@ -37,6 +37,19 @@ parsing approach, and so does this project.
 - Optional certificate-based (unattended) sign-in for scheduled runs.
 - Modules are no longer installed silently; the manager lookup no longer needs two Graph calls
   per user.
+- Loads a matching set of Microsoft Graph module versions, so machines with several versions
+  installed no longer fail with "Assembly with same name is already loaded".
+- Classifies events by the host applications in Microsoft's audit documentation (Copilot Chat via
+  Office.com, the Microsoft 365 app, Edge and Bing; on-canvas and side-pane variants of Word,
+  PowerPoint and Outlook; OneNote, SharePoint and others), and logs a per-run summary of how each
+  host was mapped.
+- Recognises already-exported events by their audit values rather than the whole CSV line, so a
+  newer script version that classifies an event differently does not duplicate it.
+- Adds -DisableWAM for machines where the Windows account broker crashes PowerShell at sign-in.
+- Incremental runs mark the resumed timestamp as UTC. Without this, Exchange Online treated it as
+  local time and rejected the next search window on machines outside UTC.
+- The users export reports how many users Microsoft Graph returned and how many have a job title,
+  and warns when the job-title filter removes everyone.
 - Added documentation, fictitious sample data and automated tests.
 
 The CSV column layout is unchanged, so the upstream Power BI template works as-is.

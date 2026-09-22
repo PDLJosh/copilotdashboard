@@ -101,6 +101,9 @@ The Power BI template is the upstream file, unmodified. The scripts were reworke
   Incremental runs re-read the previous 24 hours and skip rows that were already exported.
 - **Large tenants handled automatically.** A search window that reaches the 50,000-record limit
   is split; failed searches are retried.
+- **Copilot Chat from every entry point.** Events are classified using the host applications in
+  Microsoft's audit documentation, so Chat via office.com, the Microsoft 365 app, Edge and Bing is
+  counted as Chat rather than falling into a generic bucket.
 - **Works on non-English Windows** and on both Windows PowerShell 5.1 and PowerShell 7.
 - **Parameters instead of edits**, optional unattended sign-in, and no silent module installs.
 
@@ -117,10 +120,16 @@ Stated plainly, so you know what you are relying on:
   The scripts were also run under Windows PowerShell 5.1.
 - **Verified against Microsoft documentation**: every cloud endpoint, environment name and
   portal address. Sources are listed in [docs/cloud-differences.md](docs/cloud-differences.md).
-- **Not verified**: the scripts have not been run by the maintainer against a live tenant in
-  every cloud. The GCC Copilot product ID is community-reported and no GCC High product ID is
-  published, which is why license detection does not depend on them. If something does not
-  work in your tenant, please open an issue.
+- **Verified against a live GCC tenant** (22 September 2026): both scripts end to end - sign-in
+  to Microsoft Graph and Exchange Online, detection of the `COPILOT_FOR_MICROSOFT_365_GCC`
+  product, the users export, a 30-day events export, and an incremental re-run that re-read the
+  overlap period and wrote no duplicates. Three defects found by that test are fixed and covered
+  by tests: a Graph module version conflict, a time-zone shift in incremental search windows, and
+  the account-broker crash that `-DisableWAM` works around.
+- **Not verified**: the Commercial and GCC High editions have not been run by the maintainer
+  against a live tenant, and the certificate-based unattended sign-in has not been run live. No
+  GCC High Copilot product ID is published, which is why license detection does not depend on
+  it. If something does not work in your tenant, please open an issue.
 
 ## Repository layout
 

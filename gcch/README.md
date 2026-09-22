@@ -56,7 +56,7 @@ Expected output:
 ```
 Connected to Microsoft Graph (GCC High).
 Copilot product: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx  <product name>  (discovered)
-Processing 1284 users...
+Read 1284 users from Entra ID; 1284 have a job title and will be exported.
 Report exported to C:\M365CopilotReport\Copilot_Users.csv
 Users exported: 1284. With a Microsoft 365 Copilot license: 310.
 ```

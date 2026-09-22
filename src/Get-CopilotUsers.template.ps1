@@ -143,6 +143,30 @@ function Test-CopilotLicense ($AssignedLicenses, [hashtable]$CopilotSkus) {
     return $false
 }
 
+# Versions of each module that are installed, as module name -> versions.
+function Get-InstalledModuleVersion ([string[]]$Names) {
+    $result = @{}
+    foreach ($name in $Names) {
+        $result[$name] = @(Get-Module -ListAvailable -Name $name | ForEach-Object { $_.Version } | Sort-Object -Unique)
+    }
+    return $result
+}
+
+# The newest version that every module in $Available has installed, or $null. The Microsoft Graph
+# modules only load together when their versions match exactly. $Pinned restricts the choice to
+# a version that is already loaded in this session.
+function Select-CommonModuleVersion ([hashtable]$Available, $Pinned) {
+    $names = @($Available.Keys)
+    if ($names.Count -eq 0) { return $null }
+    $candidates = @($Available[$names[0]] | ForEach-Object { [version]$_ })
+    foreach ($name in $names) {
+        $versions = @($Available[$name] | ForEach-Object { [version]$_ })
+        $candidates = @($candidates | Where-Object { $versions -contains $_ })
+    }
+    if ($Pinned) { $candidates = @($candidates | Where-Object { $_ -eq [version]$Pinned }) }
+    return ($candidates | Sort-Object -Descending | Select-Object -First 1)
+}
+
 # Power BI reads the file with QuoteStyle.None, so a line break inside a value would split the row.
 function Remove-LineBreaks ($Value) {
     if ($null -eq $Value) { return $null }
@@ -160,22 +184,45 @@ if (-not (Test-Path -LiteralPath $OutputFolder -PathType Container)) {
 $csvUsersPath = Join-Path $OutputFolder 'Copilot_Users.csv'
 #endregion
 
-#region Connect to Microsoft Graph
-$connected = $false
-if (-not $UseExistingSession) {
-    $missing = @($RequiredModules | Where-Object { -not (Get-Module -ListAvailable -Name $_) })
-    if ($missing.Count -gt 0) {
-        if (-not $InstallMissingModules) {
-            Write-Host "Required Microsoft Graph modules are not installed. Install them with:" -ForegroundColor Yellow
-            Write-Host "    Install-Module $($missing -join ', ') -Scope CurrentUser" -ForegroundColor Yellow
+#region Load the Microsoft Graph modules
+# The Graph modules only load together when their versions match exactly, and machines often have
+# several versions installed. Use the newest version that all the required modules share; when a
+# session is already connected, stay on the version it loaded.
+$loadedAuthentication = Get-Module -Name 'Microsoft.Graph.Authentication'
+if (-not $UseExistingSession -or $loadedAuthentication) {
+    $installed = Get-InstalledModuleVersion -Names $RequiredModules
+    $missing = @($RequiredModules | Where-Object { $installed[$_].Count -eq 0 })
+    $graphVersion = Select-CommonModuleVersion -Available $installed -Pinned $loadedAuthentication.Version
+    if ($missing.Count -gt 0 -or -not $graphVersion) {
+        if ($InstallMissingModules -and -not $loadedAuthentication) {
+            Write-Host "Installing matching versions of $($RequiredModules -join ', ')..."
+            Install-Module -Name $RequiredModules -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
+            $installed = Get-InstalledModuleVersion -Names $RequiredModules
+            $graphVersion = Select-CommonModuleVersion -Available $installed
+        }
+        if (-not $graphVersion) {
+            if ($missing.Count -gt 0) {
+                Write-Host "Required Microsoft Graph modules are not installed: $($missing -join ', ')." -ForegroundColor Yellow
+            } elseif ($loadedAuthentication) {
+                Write-Host "Microsoft.Graph.Authentication $($loadedAuthentication.Version) is already loaded in this window, but the other required modules are not installed in that version." -ForegroundColor Yellow
+            } else {
+                Write-Host "The installed Microsoft Graph modules have no version in common, so they cannot be loaded together:" -ForegroundColor Yellow
+                foreach ($name in $RequiredModules) { Write-Host ("    {0}: {1}" -f $name, ($installed[$name] -join ', ')) -ForegroundColor Yellow }
+            }
+            Write-Host "Install matching versions with:" -ForegroundColor Yellow
+            Write-Host "    Install-Module $($RequiredModules -join ', ') -Scope CurrentUser -Force" -ForegroundColor Yellow
             Write-Host "or run this script again with -InstallMissingModules." -ForegroundColor Yellow
             exit 1
         }
-        Write-Host "Installing modules: $($missing -join ', ')..."
-        Install-Module -Name $missing -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop
     }
-    Import-Module $RequiredModules -ErrorAction Stop
+    foreach ($name in $RequiredModules) { Import-Module -Name $name -RequiredVersion $graphVersion -ErrorAction Stop }
+    Write-Verbose "Using Microsoft Graph modules version $graphVersion."
+}
+#endregion
 
+#region Connect to Microsoft Graph
+$connected = $false
+if (-not $UseExistingSession) {
     $connectParams = @{ NoWelcome = $true; ErrorAction = 'Stop' }
     if ($CloudProfile.GraphEnvironment) { $connectParams.Environment = $CloudProfile.GraphEnvironment }
     if ($PSCmdlet.ParameterSetName -eq 'AppOnly') {
@@ -214,10 +261,19 @@ try {
         $users = @(Get-MgUser -All -Property $UserProperties -ErrorAction Stop)
     }
 
-    if (-not $IncludeUsersWithoutJobTitle) {
-        $users = @($users | Where-Object { $_.JobTitle })
+    $totalUsers = $users.Count
+    if ($totalUsers -eq 0) {
+        Write-Warning "Microsoft Graph returned no users. Check that the account can read users in this tenant."
     }
-    Write-Host "Processing $($users.Count) users..."
+    if ($IncludeUsersWithoutJobTitle) {
+        Write-Host "Read $totalUsers users from Entra ID; exporting all of them."
+    } else {
+        $users = @($users | Where-Object { $_.JobTitle })
+        Write-Host "Read $totalUsers users from Entra ID; $($users.Count) have a job title and will be exported."
+        if ($totalUsers -gt 0 -and $users.Count -eq 0) {
+            Write-Warning "None of the users have a job title, so nothing will be exported. Populate job titles in Entra ID, or run again with -IncludeUsersWithoutJobTitle."
+        }
+    }
 
     $results = foreach ($user in $users) {
         $managerName = ""
